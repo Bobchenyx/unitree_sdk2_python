@@ -85,7 +85,7 @@ class Custom:
         self.target_pos = [
             0., kPi_2,  0., kPi_2, 0., 0., 0.,
             0., -kPi_2, 0., kPi_2, 0., 0., 0., 
-            0, 0, 0
+            # 0, 0, 0
         ]
 
         self.arm_joints = [
@@ -97,9 +97,9 @@ class Custom:
           G1JointIndex.RightShoulderYaw,   G1JointIndex.RightElbow,
           G1JointIndex.RightWristRoll,     G1JointIndex.RightWristPitch,
           G1JointIndex.RightWristYaw,
-          G1JointIndex.WaistYaw,
-          G1JointIndex.WaistRoll,
-          G1JointIndex.WaistPitch
+        #   G1JointIndex.WaistYaw,
+        #   G1JointIndex.WaistRoll,
+        #   G1JointIndex.WaistPitch
         ]
 
     def Init(self):
@@ -117,6 +117,16 @@ class Custom:
         )
         while self.first_update_low_state == False:
             time.sleep(1)
+
+        # Lock waist at startup pose (matches teleop G1_29_ArmController kp_high/kd_high).
+        WAIST_JOINTS = [G1JointIndex.WaistYaw, G1JointIndex.WaistRoll, G1JointIndex.WaistPitch]
+        for j in WAIST_JOINTS:
+            self.low_cmd.motor_cmd[j].mode = 1
+            self.low_cmd.motor_cmd[j].q  = self.low_state.motor_state[j].q
+            self.low_cmd.motor_cmd[j].dq = 0.
+            self.low_cmd.motor_cmd[j].tau = 0.
+            self.low_cmd.motor_cmd[j].kp = 300.
+            self.low_cmd.motor_cmd[j].kd = 3.0
 
         if self.first_update_low_state == True:
             self.lowCmdWriteThreadPtr.Start()
