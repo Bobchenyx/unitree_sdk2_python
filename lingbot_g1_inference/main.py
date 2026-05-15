@@ -18,8 +18,8 @@ Pipeline:
           the server's KV cache reflects reality.
        e. Request the next chunk and repeat.
 
-Usage:
-    python -m lingbot_g1_inference.main \\
+Usage (run directly from inside the lingbot_g1_inference/ directory):
+    python main.py \\
         --iface enp0s31f6 \\
         --server-host 1.2.3.4 \\
         --server-port 29056 \\
@@ -35,10 +35,10 @@ import numpy as np
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
-from .arm_controller import ArmController, INIT_POSE_READY
-from .gripper_controller import GripperController, GRIPPER_MIN, GRIPPER_MAX
-from .camera_client import CameraClient
-from .policy_client import PolicyClient
+from arm_controller import ArmController, INIT_POSE_READY
+from gripper_controller import GripperController, GRIPPER_MIN, GRIPPER_MAX
+from camera_client import CameraClient
+from policy_client import PolicyClient
 
 
 logging.basicConfig(level=logging.INFO,
@@ -104,6 +104,10 @@ def execute_chunk(action, arm_ctrl, grip_ctrl, cam_client, is_first_chunk,
 
     for t in range(start_frame, FRAME_CHUNK):
         for f in range(SUBSTEPS_PER_FRAME):
+            # Abort fast if the arm's publish thread died — otherwise we keep
+            # dispatching targets nobody is sending, with arm_sdk still latched.
+            if arm_ctrl.faulted():
+                raise RuntimeError("ArmController control thread faulted — aborting")
             tic = time.time()
 
             cmd = action[:, t, f]
@@ -160,13 +164,13 @@ def _setup_camera(args) -> CameraClient:
 
 
 def _initialize_pose(arm, grip, args) -> None:
-    """Slow ramp to INIT_POSE_READY, then close→open grippers, then settle."""
+    """Ramp to INIT_POSE_READY, then close→open grippers, then settle."""
     log.info(f"Moving arms to ready pose over {args.init_duration:.1f}s "
              f"(velocity_limit={args.velocity_limit} rad/s)")
     arm.move_to_pose(INIT_POSE_READY,
                      duration=args.init_duration,
                      velocity_limit=args.velocity_limit)
-    half = args.init_duration / 2
+    half = args.gripper_init_duration / 2
     log.info(f"Closing grippers to {GRIPPER_MIN} over {half:.1f}s")
     grip.move_to_targets(GRIPPER_MIN, GRIPPER_MIN, duration=half)
     log.info(f"Opening grippers to ({args.init_gripper_left}, {args.init_gripper_right}) "
@@ -316,11 +320,14 @@ def main():
     p.add_argument("--inference-kp-arm", type=float, default=80.0,
                    help="kp applied to shoulder/elbow joints once inference starts "
                         "(default 80; init/standby uses the controller's default kp_arm=150)")
-    p.add_argument("--init-duration", type=float, default=5.0,
-                   help="Seconds to take moving from current pose to ready pose")
-    p.add_argument("--settle-duration", type=float, default=2.0,
-                   help="Seconds to wait after init move so the arm settles at "
-                        "the target pose before entering standby (default 2.0)")
+    p.add_argument("--init-duration", type=float, default=2.0,
+                   help="Seconds for the arm to ramp from current pose to ready pose")
+    p.add_argument("--gripper-init-duration", type=float, default=1.0,
+                   help="Total seconds for the gripper close→open init gesture "
+                        "(split evenly across the two phases, default 1.0)")
+    p.add_argument("--settle-duration", type=float, default=1.0,
+                   help="Seconds to wait after the init move so the arm settles "
+                        "before entering standby (default 1.0)")
     p.add_argument("--init-gripper-left", type=float, default=5.0,
                    help="Open position after the close→open init sequence (0..5.4, default 5.0)")
     p.add_argument("--init-gripper-right", type=float, default=5.0,

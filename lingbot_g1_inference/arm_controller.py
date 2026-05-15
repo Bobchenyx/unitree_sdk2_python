@@ -14,6 +14,7 @@ Key responsibilities:
 - Compute CRC every tick
 """
 
+import logging
 import threading
 import time
 from enum import IntEnum
@@ -25,6 +26,8 @@ from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
 from unitree_sdk2py.utils.crc import CRC
 
+
+log = logging.getLogger("lingbot_g1.arm")
 
 kTopicArmSDK = "rt/arm_sdk"
 kTopicLowState = "rt/lowstate"
@@ -82,6 +85,12 @@ ARM_JOINTS = [
 ]
 WAIST_JOINTS = [G1JointIndex.WaistYaw, G1JointIndex.WaistRoll, G1JointIndex.WaistPitch]
 LEG_JOINTS = list(range(0, 12))  # joints 0..11
+
+# The 6 wrist joints get a softer kp/kd than the shoulder/elbow joints.
+WRIST_JOINT_SET = frozenset([
+    G1JointIndex.LeftWristRoll, G1JointIndex.LeftWristPitch, G1JointIndex.LeftWristYaw,
+    G1JointIndex.RightWristRoll, G1JointIndex.RightWristPitch, G1JointIndex.RightWristYaw,
+])
 
 
 # Conservative joint limits (radians) for the G1 29-DoF arm, in the same order
@@ -144,6 +153,14 @@ class ArmController:
         self._target_lock = threading.Lock()
         self._q_target = None  # set on first state update
 
+        # Guards every read/write of self.cmd (+ CRC + Write) so the publish
+        # thread, set_arm_kp, and disable_arm_sdk never race on the shared
+        # LowCmd_ struct and publish a frame whose CRC doesn't match its body.
+        self._cmd_lock = threading.Lock()
+        # Set True if a control thread dies on an unhandled exception, so the
+        # main loop can detect a silent loss of arm control and abort.
+        self._faulted = False
+
         self._stop = threading.Event()
         self._sub_thread = threading.Thread(target=self._subscribe_loop, daemon=True)
         self._pub_thread = threading.Thread(target=self._publish_loop, daemon=True)
@@ -161,16 +178,27 @@ class ArmController:
     def stop(self):
         """Signal the subscribe + publish threads to exit and wait for them.
 
-        Blocking until publish thread exits is important: callers may want to
-        write to self.cmd / self.pub themselves after stop() (e.g.
-        disable_arm_sdk), and racing against an active publish loop on the
-        same cmd object would corrupt the published CRC.
+        Blocking until the publish thread exits matters: callers write to
+        self.cmd themselves after stop() (disable_arm_sdk). The _cmd_lock makes
+        a concurrent write safe even so, but joining first means disable_arm_sdk
+        runs uncontended. If the join times out we log loudly — disable_arm_sdk
+        will still be CRC-safe via the lock, just no longer uncontended.
         """
         self._stop.set()
         if self._pub_thread.is_alive():
-            self._pub_thread.join(timeout=0.5)
+            self._pub_thread.join(timeout=2.0)
+            if self._pub_thread.is_alive():
+                log.error("publish thread did not exit within 2 s of stop()")
         if self._sub_thread.is_alive():
-            self._sub_thread.join(timeout=0.5)
+            self._sub_thread.join(timeout=2.0)
+            if self._sub_thread.is_alive():
+                log.error("subscribe thread did not exit within 2 s of stop()")
+
+    def faulted(self) -> bool:
+        """True if a control thread died on an unhandled exception. The main
+        loop should poll this and abort — a dead publish thread means arm_sdk
+        frames have stopped while the handover weight is still latched at 1."""
+        return self._faulted
 
     def get_arm_q(self) -> np.ndarray:
         """Return current 14-DoF arm joint positions."""
@@ -206,12 +234,10 @@ class ArmController:
         dynamics during inference match what the model was trained against.
         """
         self.kp_arm = kp_arm
-        wrist_set = set([G1JointIndex.LeftWristRoll, G1JointIndex.LeftWristPitch,
-                         G1JointIndex.LeftWristYaw,  G1JointIndex.RightWristRoll,
-                         G1JointIndex.RightWristPitch, G1JointIndex.RightWristYaw])
-        for j in ARM_JOINTS:
-            if j not in wrist_set:
-                self.cmd.motor_cmd[j].kp = kp_arm
+        with self._cmd_lock:
+            for j in ARM_JOINTS:
+                if j not in WRIST_JOINT_SET:
+                    self.cmd.motor_cmd[j].kp = kp_arm
 
     def move_to_pose(self, target_q: np.ndarray, duration: float = 4.0,
                      velocity_limit: float = 2.0):
@@ -232,6 +258,8 @@ class ArmController:
         try:
             steps = max(1, int(duration * self.publish_hz))
             for i in range(steps + 1):
+                if self._faulted:
+                    raise RuntimeError("publish thread faulted during move_to_pose")
                 alpha = i / steps
                 interp = start_q + alpha * (target_q - start_q)
                 self.set_arm_target(interp)
@@ -241,24 +269,39 @@ class ArmController:
 
     def disable_arm_sdk(self):
         """Smoothly ramp motor_cmd[29].q from 1 to 0 to return arm control to
-        the locomotion service. Call before exit if the robot is standing."""
+        the locomotion service. Call before exit if the robot is standing.
+
+        Once q[29] reaches 0 the arm_sdk handover weight is gone, so the loco
+        service regains authority over every joint — the leg/waist/arm kp still
+        sitting in cmd from _init_cmd_from_state no longer has any effect and
+        does not need explicit clearing.
+
+        The _cmd_lock keeps this CRC-safe even if the publish thread is somehow
+        still running (it normally is not — stop() joins it first).
+        """
         for w in np.linspace(1.0, 0.0, 50):
-            self.cmd.motor_cmd[G1JointIndex.kNotUsedJoint].q = float(w)
-            self.cmd.crc = self.crc.Crc(self.cmd)
-            self.pub.Write(self.cmd)
+            with self._cmd_lock:
+                self.cmd.motor_cmd[G1JointIndex.kNotUsedJoint].q = float(w)
+                self.cmd.crc = self.crc.Crc(self.cmd)
+                self.pub.Write(self.cmd)
             time.sleep(0.02)
 
     # ---------- internals ----------
 
     def _subscribe_loop(self):
-        while not self._stop.is_set():
-            msg = self.sub.Read()
-            if msg is not None:
-                with self._state_lock:
-                    self._latest_state = msg
-                if not self._state_ready.is_set():
-                    self._state_ready.set()
-            time.sleep(0.002)
+        try:
+            while not self._stop.is_set():
+                msg = self.sub.Read()
+                if msg is not None:
+                    with self._state_lock:
+                        self._latest_state = msg
+                    if not self._state_ready.is_set():
+                        self._state_ready.set()
+                time.sleep(0.002)
+        except Exception:
+            log.exception("subscribe loop crashed — arm state will go stale")
+            self._faulted = True
+            self._stop.set()
 
     def _init_cmd_from_state(self):
         with self._state_lock:
@@ -289,15 +332,12 @@ class ArmController:
             self.cmd.motor_cmd[j].kd = self.kd_body_lock
 
         # Arm joints: split kp/kd between shoulder-elbow and wrist
-        wrist_set = set([G1JointIndex.LeftWristRoll, G1JointIndex.LeftWristPitch,
-                         G1JointIndex.LeftWristYaw,  G1JointIndex.RightWristRoll,
-                         G1JointIndex.RightWristPitch, G1JointIndex.RightWristYaw])
         for j in ARM_JOINTS:
             self.cmd.motor_cmd[j].mode = 1
             self.cmd.motor_cmd[j].q = state.motor_state[j].q
             self.cmd.motor_cmd[j].dq = 0.0
             self.cmd.motor_cmd[j].tau = 0.0
-            if j in wrist_set:
+            if j in WRIST_JOINT_SET:
                 self.cmd.motor_cmd[j].kp = self.kp_wrist
                 self.cmd.motor_cmd[j].kd = self.kd_wrist
             else:
@@ -315,24 +355,33 @@ class ArmController:
         return q_current + delta / max(motion_scale, 1.0)
 
     def _publish_loop(self):
-        while not self._stop.is_set():
-            t0 = time.time()
+        try:
+            while not self._stop.is_set():
+                t0 = time.time()
 
-            with self._target_lock:
-                q_target = self._q_target.copy()
+                with self._target_lock:
+                    q_target = self._q_target.copy()
 
-            q_current = self.get_arm_q()
-            q_cmd = self._clip_target(q_target, q_current)
+                q_current = self.get_arm_q()
+                q_cmd = self._clip_target(q_target, q_current)
 
-            for idx, j in enumerate(ARM_JOINTS):
-                self.cmd.motor_cmd[j].q = float(q_cmd[idx])
-                self.cmd.motor_cmd[j].dq = 0.0
-                self.cmd.motor_cmd[j].tau = 0.0
+                # Hold _cmd_lock across mutation + CRC + Write so the published
+                # frame's CRC always matches its body, even if set_arm_kp or
+                # disable_arm_sdk touch self.cmd from the main thread.
+                with self._cmd_lock:
+                    for idx, j in enumerate(ARM_JOINTS):
+                        self.cmd.motor_cmd[j].q = float(q_cmd[idx])
+                        self.cmd.motor_cmd[j].dq = 0.0
+                        self.cmd.motor_cmd[j].tau = 0.0
+                    self.cmd.crc = self.crc.Crc(self.cmd)
+                    self.pub.Write(self.cmd)
 
-            self.cmd.crc = self.crc.Crc(self.cmd)
-            self.pub.Write(self.cmd)
-
-            elapsed = time.time() - t0
-            sleep = self.control_dt - elapsed
-            if sleep > 0:
-                time.sleep(sleep)
+                elapsed = time.time() - t0
+                sleep = self.control_dt - elapsed
+                if sleep > 0:
+                    time.sleep(sleep)
+        except Exception:
+            log.exception("publish loop crashed — arm_sdk frames stopped; "
+                          "main loop must abort and release arm_sdk")
+            self._faulted = True
+            self._stop.set()

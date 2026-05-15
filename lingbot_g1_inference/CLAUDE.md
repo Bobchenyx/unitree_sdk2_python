@@ -21,22 +21,22 @@ pip3 install -e .          # installs unitree_sdk2py
 
 Extra runtime deps that are NOT in `setup.py`: `websockets`, `msgpack`, `teleimager` (the G1 image-server client). Install ad-hoc as needed.
 
-Run the full pipeline (must be run as a module so relative imports resolve):
+Run the full pipeline (from inside this directory):
 
 ```bash
-python -m lingbot_g1_inference.main \
+python main.py \
     --iface enp0s31f6 \
     --server-host <cloud-ip> \
     --server-port 29056 \
     --prompt "pick up the pink object and place it on the blue cross mark"
 ```
 
-CWD must be the repo root (`unitree_sdk2_python/`), not this directory.
+The modules use flat (absolute) imports of their siblings, so `main.py` is run directly — `python -m lingbot_g1_inference.main` will NOT work. Python puts the script's own directory on `sys.path`, so the sibling imports resolve regardless of CWD.
 
 Validate cloud connectivity without touching the robot:
 
 ```bash
-python -m lingbot_g1_inference.smoke_test --server-host <cloud-ip> --server-port 29056
+python smoke_test.py --server-host <cloud-ip> --server-port 29056
 ```
 
 There are no tests, linters, or build configs in this package.

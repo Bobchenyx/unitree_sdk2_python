@@ -9,7 +9,7 @@ from typing import Dict, Optional, Tuple
 
 import websockets.sync.client
 
-from .msgpack_numpy import Packer, unpackb
+from msgpack_numpy import Packer, unpackb
 
 
 class PolicyClient:

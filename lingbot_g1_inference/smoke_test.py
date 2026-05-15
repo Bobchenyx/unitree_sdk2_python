@@ -4,8 +4,8 @@ Sends a synthetic 3-camera observation to the cloud LingBot-VA server and prints
 the action chunk shape. Use this to validate connectivity, server health, and
 the policy-client contract before involving the physical robot.
 
-Usage:
-    python -m lingbot_g1_inference.smoke_test \\
+Usage (run directly from inside the lingbot_g1_inference/ directory):
+    python smoke_test.py \\
         --server-host 1.2.3.4 --server-port 29056
 """
 
@@ -14,7 +14,7 @@ import logging
 
 import numpy as np
 
-from .policy_client import PolicyClient
+from policy_client import PolicyClient
 
 
 logging.basicConfig(level=logging.INFO,
